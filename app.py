@@ -1,11 +1,3 @@
-
----
-
-# 5) `app.py`
-
-> Cumple: **matplotlib**, **HMAC**, **Streamlit Secrets**, **sin seaborn**, listo para Cloud.
-
-```python
 import io
 import os
 import hmac
