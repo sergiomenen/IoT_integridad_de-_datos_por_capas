@@ -1,306 +1,170 @@
-import io
-import os
-import hmac
-import hashlib
-from datetime import datetime, timedelta
+import time, os, hmac, hashlib
+from collections import deque
 import numpy as np
-import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# ---------------------------
-# Configuración general
-# ---------------------------
-st.set_page_config(
-    page_title="Mini-Lab IoT — Integridad & Capas",
-    page_icon="🛡️",
-    layout="wide"
-)
+# ---------- Configuración ----------
+st.set_page_config(page_title="Mini-Lab IoT: Integridad & Capas", layout="wide")
+st.title("Mini-Lab IoT — Integridad de datos & Capas")
+st.caption("Sesión 1: sensor→canal→verificación | Sesión 2: capas IoT | Sesión 3: Caso & entregables")
 
-# Estilos mínimos
-st.markdown("""
-<style>
-.small { font-size:0.85rem; color:#666; }
-.ok { color: #1b7f3b; font-weight:600; }
-.bad { color: #b3002d; font-weight:600; }
-.codebox { font-family: monospace; background:#0f1117; color:#eaeef3; padding:8px 10px; border-radius:8px; }
-</style>
-""", unsafe_allow_html=True)
+np.random.seed(7)
 
-# ---------------------------
-# Utilidades de integridad
-# ---------------------------
+# ---------- Sensor y canal ----------
+def sensor_temp(base=25.0, noise=0.3, drift=0.002, t=0):
+    """Temperatura base + ruido gaussiano + deriva lenta."""
+    return base + np.random.normal(0, noise) + drift * t
 
-def get_secret_key():
-    # Intenta leer de secrets; si no existe, crea una temporal de solo sesión
-    tmp_env_key = st.session_state.get("_tmp_hmac_key")
-    key = st.secrets.get("hmac_key", None)
-    if key is None:
-        if tmp_env_key is None:
-            tmp_env_key = hashlib.sha256(os.urandom(64)).hexdigest()
-            st.session_state["_tmp_hmac_key"] = tmp_env_key
-        return tmp_env_key, False
-    return str(key), True
+class Canal:
+    def __init__(self, loss_prob=0.05, min_ms=20, max_ms=120, tamper=False, tamper_bias=10.0):
+        self.loss_prob = loss_prob
+        self.min_ms = min_ms
+        self.max_ms = max_ms
+        self.tamper = tamper
+        self.tamper_bias = tamper_bias
 
-def canonical_string(row: pd.Series) -> str:
-    """
-    Cadena canónica por registro: asegura orden estable de campos firmados.
-    """
-    # Campos mínimos
-    ts = str(row.get("timestamp", ""))
-    dev = str(row.get("device_id", ""))
-    metric = str(row.get("metric", ""))
-    value = str(row.get("value", ""))
-    # Metadatos de capa (si existen)
-    layer_tag = str(row.get("layer_tag", ""))  # 'perception'|'network'|'application' o vacío
-    return "|".join([ts, dev, metric, value, layer_tag])
+    def enviar(self, valor):
+        if np.random.rand() < self.loss_prob:
+            return None, None
+        lat = np.random.uniform(self.min_ms, self.max_ms)
+        v = valor + self.tamper_bias if self.tamper else valor
+        return v, lat
 
-def hmac_sign(text: str, key: str) -> str:
-    return hmac.new(key.encode("utf-8"), text.encode("utf-8"), hashlib.sha256).hexdigest()
+# ---------- Hash/HMAC ----------
+SECRET = st.secrets.get("HMAC_SECRET", os.urandom(16))
 
-def sign_dataframe(df: pd.DataFrame, key: str) -> pd.DataFrame:
-    df2 = df.copy()
-    if "layer_tag" not in df2.columns:
-        df2["layer_tag"] = ""
-    df2["signature"] = df2.apply(lambda r: hmac_sign(canonical_string(r), key), axis=1)
-    return df2
+def sha256_str(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
 
-def verify_dataframe(df_signed: pd.DataFrame, key: str) -> pd.DataFrame:
-    dfv = df_signed.copy()
-    expected = dfv.apply(lambda r: hmac_sign(canonical_string(r), key), axis=1)
-    dfv["valid"] = (expected == dfv["signature"])
-    return dfv
+def hmac_sha256(msg: str, key: bytes=SECRET) -> str:
+    return hmac.new(key, msg.encode(), hashlib.sha256).hexdigest()
 
-def merkle_root(hex_hashes: list[str]) -> str:
-    """
-    Merkle root simple sobre la lista de firmas hex (SHA256 sobre concatenaciones binarias).
-    """
-    if not hex_hashes:
-        return ""
-    level = [bytes.fromhex(h) for h in hex_hashes]
-    while len(level) > 1:
-        nxt = []
-        for i in range(0, len(level), 2):
-            left = level[i]
-            right = level[i+1] if i+1 < len(level) else left
-            nxt.append(hashlib.sha256(left + right).digest())
-        level = nxt
-    return level[0].hex()
+# ---------- Tabs ----------
+tab1, tab2, tab3 = st.tabs(["Sesión 1 · Integridad (HMAC)", "Sesión 2 · Capas IoT", "Caso & Entregables"])
 
-def simulate_tamper(df: pd.DataFrame, layer: str, intensity: float, pct_rows: float, seed: int = 42) -> pd.DataFrame:
-    """
-    Simula manipulación en una capa:
-    - perception: altera 'value' con ruido
-    - network: altera orden/duplicados/timestamp jitter
-    - application: cambia algunos 'metric' o redondea 'value'
-    """
-    rng = np.random.default_rng(seed)
-    tampered = df.copy()
-    n = len(tampered)
-    k = max(1, int(n * pct_rows))
-    idx = rng.choice(n, size=k, replace=False)
+# ---------- Sesión 1 ----------
+with tab1:
+    st.subheader("Streaming de sensor + canal (latencia/pérdida) + tampering + verificación")
+    colA, colB, colC, colD, colE = st.columns([1,1,1,1,1])
+    dur_seg = colA.slider("Duración (s)", 5, 60, 20, step=5)
+    perdida = colB.slider("Pérdida (prob.)", 0.0, 0.30, 0.05, step=0.01)
+    tamper_on = colC.selectbox("Tampering", ["Sin manipulación", "Manipulado"])
+    check = colD.selectbox("Integridad", ["Sin verificación", "SHA256", "HMAC"])
+    tamper_bias = colE.slider("Tamper bias (°C)", 5, 20, 15, step=1)
+    run = st.button("▶ Ejecutar simulación", type="primary")
 
-    if layer == "perception":
-        noise = rng.normal(loc=0.0, scale=intensity, size=k)
-        tampered.loc[tampered.index[idx], "value"] = tampered.loc[tampered.index[idx], "value"] + noise
-        tampered.loc[tampered.index[idx], "layer_tag"] = "perception"
+    ph_chart = st.empty()
+    ph_text = st.empty()
+    csv_btn = st.empty()
 
-    elif layer == "network":
-        # timestamp jitter y duplicado aleatorio
-        jitter = rng.integers(low=-int(60*intensity), high=int(60*intensity)+1, size=k)
-        base_ts = pd.to_datetime(tampered.loc[tampered.index[idx], "timestamp"], errors="coerce")
-        tampered.loc[tampered.index[idx], "timestamp"] = (base_ts + pd.to_timedelta(jitter, unit="s")).astype(str)
-        if k >= 2:
-            dup_rows = tampered.iloc[idx[:k//2]]
-            tampered = pd.concat([tampered, dup_rows], ignore_index=True)
-        tampered = tampered.sample(frac=1.0, random_state=seed).reset_index(drop=True)
-        tampered["layer_tag"] = tampered.get("layer_tag", "")
-        # Marcar solo los tocados originales
-        for i in idx:
-            if i < len(tampered):
-                tampered.at[i, "layer_tag"] = "network"
+    if run:
+        canal_ok = Canal(loss_prob=perdida, tamper=False)
+        canal_bad = Canal(loss_prob=perdida, tamper=True, tamper_bias=tamper_bias)
+        c = canal_bad if tamper_on == "Manipulado" else canal_ok
 
-    elif layer == "application":
-        # redondeo agresivo o cambio de métrica
-        choose = rng.choice(["round", "rename"], size=k)
-        rows = tampered.index[idx]
-        for r, ch in zip(rows, choose):
-            if ch == "round":
-                tampered.at[r, "value"] = float(np.round(tampered.at[r, "value"], int(max(0, 1 - intensity))))
-            else:
-                tampered.at[r, "metric"] = str(tampered.at[r, "metric"]) + "_alt"
-            tampered.at[r, "layer_tag"] = "application"
+        t0 = time.time()
+        ts, rx_vals, verdict = [], [], []
 
-    return tampered
+        while time.time() - t0 < dur_seg:
+            t = time.time() - t0
+            raw = sensor_temp(t=t)
+            msg = f"{raw:.2f}"
 
-# ---------------------------
-# Generación/entrada de datos
-# ---------------------------
+            sig = None
+            if check == "SHA256":
+                sig = sha256_str(msg)
+            elif check == "HMAC":
+                sig = hmac_sha256(msg)
 
-def generate_sample(n_devices=3, n_points=200, start=None):
-    if start is None:
-        start = datetime.utcnow() - timedelta(hours=1)
-    rows = []
-    metrics = ["temperature", "vibration", "pressure"]
-    for d in range(n_devices):
-        dev_id = f"dev-{d+1:02d}"
-        t0 = start
-        for i in range(n_points):
-            ts = t0 + timedelta(seconds=i*15)
-            metric = metrics[i % len(metrics)]
-            base = {"temperature": 70.0, "vibration": 2.0, "pressure": 5.0}[metric]
-            val = base + np.sin(i/12.0) * (0.5 if metric=="temperature" else 0.2) + np.random.normal(0, 0.02)
-            rows.append([ts.isoformat(), dev_id, metric, float(val)])
-    df = pd.DataFrame(rows, columns=["timestamp","device_id","metric","value"])
-    return df
+            rx, lat = c.enviar(float(msg))
+            if rx is None:
+                time.sleep(0.05)
+                continue
 
-# ---------------------------
-# UI
-# ---------------------------
+            ok = True
+            if check == "SHA256":
+                ok = (sha256_str(f"{rx:.2f}") == sig)
+            elif check == "HMAC":
+                ok = (hmac_sha256(f"{rx:.2f}") == sig)
 
-st.title("🛡️ Mini-Lab IoT — Integridad & Capas")
-st.caption("Firma y verificación HMAC por registro • Simulación de manipulación por capa • Visualización con matplotlib • Raíz Merkle opcional")
+            ts.append(t)
+            rx_vals.append(rx)
+            verdict.append(ok)
 
-with st.sidebar:
-    st.header("⚙️ Configuración")
-    key, from_secrets = get_secret_key()
-    if from_secrets:
-        st.markdown("**Clave HMAC**: leída de *Streamlit Secrets*. ✅")
-    else:
-        st.markdown("**Clave HMAC**: temporal de sesión (usa *Secrets* en producción). ⚠️")
-    st.code(key[:8] + "..." + key[-8:], language="text")
+            fig, ax = plt.subplots()
+            ax.plot(ts, rx_vals, marker='o', linewidth=1)
+            ax.set_title("Temperatura recibida (°C)")
+            ax.set_xlabel("Tiempo (s)")
+            ax.set_ylabel("°C")
+            bad_x = [tt for tt,v in zip(ts, verdict) if not v]
+            bad_y = [vv for vv,v in zip(rx_vals, verdict) if not v]
+            if bad_x:
+                ax.scatter(bad_x, bad_y, s=60, edgecolor='k', c='r', label='Fallo integridad')
+                ax.legend()
+            ph_chart.pyplot(fig)
 
-    st.divider()
-    mode = st.radio("Modo de trabajo", ["🔧 Generar datos demo", "📤 Subir CSV"], index=0)
+            total = len(verdict)
+            malos = sum(1 for v in verdict if not v)
+            ph_text.info(f"Samples: {total} | Fallos integridad: {malos} | Tampering: {tamper_on} | Verificación: {check}")
+            time.sleep(0.25)
 
-    st.markdown("**Formato esperado CSV**: `timestamp,device_id,metric,value`", help="timestamp ISO-8601, value numérico.")
+        import pandas as pd
+        df = pd.DataFrame({"t": ts, "rx": rx_vals, "ok": verdict})
+        csv_btn.download_button("⬇ Exportar CSV", df.to_csv(index=False), "resultados.csv", "text/csv")
 
-# Entrada de datos
-if mode == "🔧 Generar datos demo":
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        ndev = st.number_input("Nº dispositivos", 1, 20, 3, 1)
-    with c2:
-        npts = st.number_input("Puntos por dispositivo", 50, 2000, 200, 50)
-    with c3:
-        seed = st.number_input("Semilla aleatoria", 0, 9999, 42, 1)
-    rng = np.random.default_rng(int(seed))
-    base = generate_sample(n_devices=int(ndev), n_points=int(npts))
-else:
-    uploaded = st.file_uploader("Sube tu CSV", type=["csv"])
-    if uploaded is None:
-        st.info("Sube un CSV para continuar o cambia a *Generar datos demo* en la barra lateral.")
-        st.stop()
-    base = pd.read_csv(uploaded)
-    expected_cols = {"timestamp","device_id","metric","value"}
-    if not expected_cols.issubset(set(map(str.lower, base.columns))):
-        st.error("El CSV debe incluir columnas: timestamp, device_id, metric, value")
-        st.stop()
-    # Normaliza nombres por si vienen capitalizados
-    base.columns = [c.lower() for c in base.columns]
-
-st.subheader("1) Datos de entrada")
-st.dataframe(base.head(20), use_container_width=True)
-
-# Firma del lote original
-st.subheader("2) Firmado (HMAC por registro)")
-colA, colB = st.columns([2,1], vertical_alignment="bottom")
-
-with colB:
-    with st.expander("Parámetros de firma"):
-        include_layer_tag = st.checkbox("Incluir 'layer_tag' en la cadena canónica", value=True,
-                                        help="Marca qué capa tocó el registro; vacía si sin alteración.")
-layer_info = " (con layer_tag)" if include_layer_tag else ""
-if not include_layer_tag:
-    base_no_tag = base.copy()
-    if "layer_tag" in base_no_tag.columns:
-        base_no_tag = base_no_tag.drop(columns=["layer_tag"])
-    base_to_sign = base_no_tag
-else:
-    base_to_sign = base.assign(layer_tag="")
-
-signed_base = sign_dataframe(base_to_sign, key)
-st.success(f"✅ Lote firmado{layer_info}. Registros: {len(signed_base)}")
-st.dataframe(signed_base.head(20), use_container_width=True)
-
-# Merkle root opcional
-with st.expander("🔗 Merkle root del lote firmado (opcional)"):
-    root = merkle_root(list(signed_base["signature"].values))
-    st.markdown("**Merkle Root:**")
-    st.code(root if root else "(vacío)", language="text")
-    st.caption("Ancla este hash fuera del sistema (p.ej., ticket interno, email a auditoría, etc.).")
-
-# Simulación de manipulación
-st.subheader("3) Simular manipulación por capa")
-cc1, cc2, cc3, cc4 = st.columns([1.2,1,1,1])
-with cc1:
-    tamper_layer = st.selectbox("Capa a manipular", ["perception", "network", "application"])
-with cc2:
-    pct = st.slider("% de filas afectadas", 1, 50, 10, 1)
-with cc3:
-    intensity = st.slider("Intensidad", 1, 20, 5, 1)
-with cc4:
-    seed2 = st.number_input("Semilla", 0, 9999, 7, 1)
-
-if st.button("💥 Aplicar manipulación"):
-    tampered = simulate_tamper(signed_base, tamper_layer, intensity=float(intensity), pct_rows=pct/100.0, seed=int(seed2))
-    st.session_state["tampered"] = tampered
-    st.toast(f"Manipulación simulada en capa '{tamper_layer}'.", icon="⚠️")
-
-tampered = st.session_state.get("tampered", signed_base.copy())
-st.dataframe(tampered.head(20), use_container_width=True)
-
-# Verificación
-st.subheader("4) Verificación de integridad")
-verified = verify_dataframe(tampered, key)
-ok = verified["valid"].sum()
-bad = len(verified) - ok
-
-cA, cB = st.columns(2)
-with cA:
-    st.markdown(f"**Resultado:** <span class='ok'>OK {ok}</span> / <span class='bad'>ALTERADOS {bad}</span>", unsafe_allow_html=True)
-with cB:
-    st.download_button("⬇️ Exportar CSV verificado", data=verified.to_csv(index=False).encode("utf-8"),
-                       file_name="iot_verified.csv", mime="text/csv")
-
-with st.expander("Ver filas alteradas"):
-    st.dataframe(verified[~verified["valid"]].head(200), use_container_width=True)
-
-# Visualización (matplotlib)
-st.subheader("5) Visualización")
-vc1, vc2 = st.columns([1,1])
-with vc1:
-    dev_choice = st.selectbox("Dispositivo", sorted(verified["device_id"].unique().tolist()))
-with vc2:
-    metric_choice = st.selectbox("Métrica", sorted(verified["metric"].unique().tolist()))
-
-plot_df = verified[(verified["device_id"]==dev_choice) & (verified["metric"]==metric_choice)].copy()
-# parse timestamps robustamente
-plot_df["ts"] = pd.to_datetime(plot_df["timestamp"], errors="coerce")
-
-fig = plt.figure(figsize=(10, 4.5))
-plt.plot(plot_df["ts"], plot_df["value"], linewidth=1.5, label="Valor")
-if "valid" in plot_df.columns:
-    # Pintar puntos rojos en alterados (sin especificar color fijo, usamos marker y anotación)
-    bad_pts = plot_df[~plot_df["valid"]]
-    if len(bad_pts) > 0:
-        # Para cumplir la restricción: no fijamos color; solo marcador distinto
-        plt.scatter(bad_pts["ts"], bad_pts["value"], marker="x", s=30, label="Alterado")
-plt.title(f"{dev_choice} · {metric_choice}")
-plt.xlabel("Tiempo")
-plt.ylabel("Valor")
-plt.legend()
-plt.tight_layout()
-st.pyplot(fig)
-
-st.divider()
-st.markdown("### 📚 Notas didácticas")
-st.markdown("""
-- **Cadena canónica** firmada por registro: `timestamp|device_id|metric|value|layer_tag`.
-- **layer_tag** refleja en qué **capa** se alteró el dato: *perception* (sensor/edge), *network* (transporte), *application* (plataforma).
-- Si cualquier campo cambia **después** de firmar, la **verificación falla**.
-- **Merkle Root** del lote permite anclar un único hash representativo fuera del sistema (auditoría, registros, etc.).
-- La clave HMAC **no debe** residir en el código ni en el CSV: se gestiona con **Streamlit Secrets**.
+    st.markdown("""
+**Qué observar**  
+- Tampering **OFF** → todo verde.  
+- Tampering **ON** + **SHA256** → un atacante que recalcula el hash puede colarse.  
+- Tampering **ON** + **HMAC** → fallos rojos (no se puede recomputar la firma sin clave).  
 """)
 
-st.caption("© 2025 — Mini-Lab IoT Integridad & Capas. Construido con Streamlit + matplotlib (sin seaborn).")
+# ---------- Sesión 2 ----------
+with tab2:
+    st.subheader("Capas IoT (Percepción, Red, Aplicación) · Trade-offs")
+    proto = st.selectbox("Protocolo", ["WiFi","LoRaWAN","Zigbee","NB-IoT"], index=1)
+    n_sens = st.slider("# Sensores", 1, 20, 4)
+    alertas = st.checkbox("Alertas habilitadas", value=True)
+
+    def perfil_protocolo(p):
+        if p=="WiFi":   return dict(bw=54000, lat=30,  mAh=200)
+        if p=="Zigbee": return dict(bw=250,   lat=60,  mAh=30)
+        if p=="LoRaWAN":return dict(bw=5,     lat=500, mAh=5)
+        if p=="NB-IoT": return dict(bw=60,    lat=300, mAh=10)
+
+    def score_sistema(bw_kbps, lat_ms, energia_mAh_dia, n_sens, alertas):
+        bw_need = n_sens * 2
+        ok_bw = bw_kbps >= bw_need
+        score = 0
+        score += 2 if ok_bw else -2
+        score += 2 if lat_ms < 200 else 0
+        score += 2 if alertas else 0
+        score -= 1 if energia_mAh_dia > 50 else 0
+        return score, {"ok_bw": ok_bw, "bw_need": bw_need}
+
+    perf = perfil_protocolo(proto)
+    sc, meta = score_sistema(perf["bw"], perf["lat"], perf["mAh"], n_sens, alertas)
+
+    st.write(f"**Protocolo**: {proto} | **BW disp.** {perf['bw']} kbps | **Lat.** {perf['lat']} ms | **Consumo** {perf['mAh']} mAh/día")
+    st.write(f"**Sensores**: {n_sens} → **BW requerido** ~{meta['bw_need']} kbps | **OK_BW**: {meta['ok_bw']}")
+    st.success(f"Score (heurístico): {sc}")
+
+    fig2, ax2 = plt.subplots()
+    ax2.bar(["BW requerido","BW disponible"], [meta['bw_need'], perf['bw']])
+    ax2.set_title("Ancho de banda: requerido vs disponible")
+    ax2.set_ylabel("kbps")
+    st.pyplot(fig2)
+
+# ---------- Caso ----------
+with tab3:
+    st.subheader("Caso: Blockchain en la Fábrica Conectada")
+    st.markdown("""
+**Entregables del alumno**
+
+- **Sesión 1**: ejecutar con *Tampering ON* + *HMAC* → capturar pantalla con nº de fallos y añadir **3 líneas de reflexión**.
+- **Sesión 2**: elegir un protocolo → capturar el bar chart y justificar en **3 líneas** el trade-off latencia/energía.
+
+📄 Documento del caso: si está disponible, revisa `docs/caso.pdf`.  
+Si no, usa este espacio como referencia placeholder.
+""")
