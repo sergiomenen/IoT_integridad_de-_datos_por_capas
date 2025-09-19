@@ -6,7 +6,7 @@ Aplicación interactiva en **Streamlit** que permite:
 
 ---
 
-## 🚀 Despliegue en Streamlit Cloud (sin CLI)
+## Despliegue en Streamlit Cloud (sin CLI)
 
 1. Crea un repositorio en GitHub con:
    - `app.py`
@@ -31,14 +31,14 @@ Aplicación interactiva en **Streamlit** que permite:
 
 ---
 
-## ✅ Checklist de verificación
+## Checklist de verificación
 
 - **Sesión 1**: con *Tampering ON + HMAC* aparecen puntos rojos en el gráfico y aumenta el contador de fallos.
 - **Sesión 2**: el bar chart responde al nº de sensores y protocolo; el score cambia según latencia/energía.
 
 ---
 
-## 📝 Notas docentes
+## Notas docentes
 
 - Un hash simple (SHA256) puede ser recalculado por un atacante que manipula datos.
 - HMAC requiere clave secreta compartida → protege integridad contra manipulación sin clave.
@@ -46,7 +46,7 @@ Aplicación interactiva en **Streamlit** que permite:
 
 ---
 
-## 🔎 Prueba rápida
+## Prueba rápida
 
 1. Abre la app en Streamlit Cloud.
 2. Ve a **Sesión 1**, selecciona *Tampering = Manipulado* y *Integridad = HMAC*, pulsa **Ejecutar simulación**.
